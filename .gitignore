@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtualenv
+.venv/
+venv/
+.env
+
+# Tests / tooling
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Recordings and logs (live.py --record/--log, analyze.py --csv)
+*.npz
+/*.csv
+*.mp4
+*.avi
+*.mov
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

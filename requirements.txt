@@ -1,0 +1,5 @@
+numpy
+scipy
+opencv-python>=4.8
+torch>=2.1        # RhythmMamba only; POS runs without it
+pytest            # tests
