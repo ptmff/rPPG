@@ -72,12 +72,12 @@ def main():
                 fs, bvp = m.bvp(t, rgb)
                 r[name], r[name + "_snr"] = sig.estimate_hr(bvp, fs)[:2]
             ms = fusion.multiscale(rm, t, frames)
-            r["RM"], r["RM_snr"] = next((h, s) for sc, h, s in ms if sc == 1.0)
-            r["RM-multiscale"], r["RM-multiscale_snr"], _ = fusion.octave_vote([(h, s, "learned") for _, h, s in ms])
+            r["RM"], r["RM_snr"] = next((h, s) for sc, h, s, *_ in ms if sc == 1.0)
+            r["RM-multiscale"], r["RM-multiscale_snr"], _ = fusion.octave_vote([(h, s, "learned") for _, h, s, *_ in ms])
             r["Fusion"], r["Fusion_snr"], _ = fusion.octave_vote(
                 [(r["POS"], r["POS_snr"], "classic"), (r["CHROM"], r["CHROM_snr"], "classic")]
-                + [(h, s, "learned") for _, h, s in ms])
-            r["scales"] = " ".join(f"x{sc}:{h:.1f}" for sc, h, _ in ms)
+                + [(h, s, "learned") for _, h, s, *_ in ms])
+            r["scales"] = " ".join(f"x{sc}:{h:.1f}" for sc, h, *_ in ms)
             rows.append(r)
             print(f"{cond:5s} {bpm:5.0f} | " + "  ".join(f"{n} {r[n]:6.1f}" for n in names)
                   + f"  [{r['scales']}]", flush=True)

@@ -1,18 +1,25 @@
 # Live rPPG: пульс по веб-камере
 
-Прототип: веб-камера → лицо (YuNet) → два метода параллельно:
+Прототип: веб-камера → лицо (YuNet) → несколько методов параллельно и итоговая оценка:
 
 - **POS** (Wang et al., 2017): классический, без обучения. Работает по среднему цвету кожи лба и щёк.
 - **RhythmMamba** (Zou et al., AAAI 2025): нейросеть с оригинальными весами авторов.
   Слой Mamba переписан на чистый PyTorch ([rppg/models/mamba_torch.py](rppg/models/mamba_torch.py)),
   поэтому модель работает на Mac без CUDA и без `mamba-ssm`.
+- **CHROM** (de Haan & Jeanne, 2013): второй классический метод без обучения.
+- **Fused** — итоговая ЧСС ([rppg/fusion.py](rppg/fusion.py)). RhythmMamba прогоняется на трёх
+  масштабах времени (×0.75 / ×1 / ×1.25), затем все оценки голосуют с учётом октавы: оценка
+  сети, равная удвоенной другой, считается за неё (на низком пульсе сеть выдаёт удвоенную
+  частоту). Голоса считаются по семействам методов, поэтому масштабы сети не перевешивают POS
+  и CHROM. Подробности и цифры — в WORKLOG, раздел 11.
 
 ## Запуск
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python live.py                 # веб-камера 0, оба метода
+.venv/bin/python live.py                 # веб-камера 0, все методы и итоговая оценка
 .venv/bin/python live.py --method pos    # только POS (torch не нужен)
+.venv/bin/python live.py --scales 1.0    # RhythmMamba на одном масштабе, втрое быстрее
 .venv/bin/python live.py --weights weights/PURE_cross_RhythmMamba.pth
 ```
 
@@ -24,7 +31,9 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 красный — скорее шум. Выход: `q` или `Esc`.
 
 Первая оценка появляется через 6 с, дальше обновляется каждую секунду по окну 10 с.
-RhythmMamba по умолчанию считает на GPU Apple (MPS): около 0.5 с на окно, на CPU около 1 с (`--device cpu`).
+RhythmMamba по умолчанию считает на GPU Apple (MPS): около 0.5 с на окно на одном масштабе, на CPU
+около 1 с (`--device cpu`). Многомасштабный прогон делает три прохода, то есть примерно втрое дольше;
+пока идёт расчёт, новые окна пропускаются, поэтому интерфейс не тормозит.
 
 ## Как получить нормальный результат
 
@@ -63,6 +72,15 @@ RhythmMamba по умолчанию считает на GPU Apple (MPS): око�
 | `PURE_cross_RhythmMamba.pth` | PURE: лаборатория, 30 кадров/с | чистые условия |
 | `UBFC_cross_RhythmMamba.pth` | UBFC-rPPG | чистые условия |
 
+## Сравнение на синтетике
+
+```bash
+.venv/bin/python bench_synthetic.py      # пульс 45–170, чистый и зашумлённый вариант
+```
+
+Синтетическое «лицо» с известным пульсом, сравниваются POS, CHROM, RhythmMamba, её
+многомасштабный прогон и итоговая оценка.
+
 ## Тесты
 
 ```bash
@@ -76,7 +94,11 @@ RhythmMamba по умолчанию считает на GPU Apple (MPS): око�
 - [live.py](live.py): захват, буфер, отрисовка, лог
 - [rppg/face.py](rppg/face.py): трекинг лица, участки кожи, кроп 128×128 как в rPPG-Toolbox
 - [rppg/signal.py](rppg/signal.py): пересчёт на ровную частоту кадров, фильтры, частота пульса и SNR
-- [rppg/methods/pos.py](rppg/methods/pos.py), [rppg/methods/rhythmmamba.py](rppg/methods/rhythmmamba.py): методы
+- [rppg/methods/pos.py](rppg/methods/pos.py), [rppg/methods/chrom.py](rppg/methods/chrom.py),
+  [rppg/methods/rhythmmamba.py](rppg/methods/rhythmmamba.py): методы
+- [rppg/fusion.py](rppg/fusion.py): многомасштабный прогон и итоговая оценка
+- [analyze.py](analyze.py), [eval.py](eval.py), [bench_synthetic.py](bench_synthetic.py): разбор записи,
+  прогон по датасету формата UBFC-rPPG, сравнение на синтетике
 - [rppg/models/](rppg/models/): модель RhythmMamba из репозитория авторов и Mamba на чистом PyTorch
 
 ## Журнал работы

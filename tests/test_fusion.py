@@ -58,4 +58,4 @@ def test_multiscale_restores_fs():
     m = _ScaleEcho()
     out = fusion.multiscale(m, None, None)
     assert m.fs == 30.0
-    assert [s for s, _, _ in out] == list(fusion.SCALES)
+    assert [o[0] for o in out] == list(fusion.SCALES)

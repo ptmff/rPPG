@@ -1,7 +1,8 @@
-"""Live heart rate from a webcam (or a video file) with POS and/or RhythmMamba.
+"""Live heart rate from a webcam (or a video file) with POS, CHROM and RhythmMamba.
 
-    python live.py                          # webcam 0, both methods
+    python live.py                          # webcam 0, all methods + the fused estimate
     python live.py --method pos             # classical baseline only
+    python live.py --scales 1.0             # RhythmMamba at one time scale (3x faster)
     python live.py --video clip.mp4 --headless --log out.csv
 
 Keys in the window: q / Esc - quit, r - pause/resume recording (--record path).
@@ -18,20 +19,26 @@ from collections import deque
 import cv2
 import numpy as np
 
+from rppg import fusion
 from rppg import signal as sig
 from rppg.face import FaceTracker
+from rppg.methods.chrom import CHROM
 from rppg.methods.pos import POS
 from rppg.source import Camera, VideoFile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_WEIGHTS = os.path.join(HERE, "weights", "MMPD_intra_RhythmMamba.pth")
+FUSED = "Fused"  # octave-aware vote over all methods (rppg/fusion.py)
 
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--camera", type=int, default=0)
     p.add_argument("--video", help="process a video file instead of the webcam")
-    p.add_argument("--method", choices=["pos", "rm", "both"], default="both")
+    p.add_argument("--method", choices=["pos", "chrom", "rm", "both", "all"], default="all",
+                   help="both = POS + RhythmMamba, all = POS + CHROM + RhythmMamba")
+    p.add_argument("--scales", type=float, nargs="+", default=list(fusion.SCALES),
+                   help="time scales RhythmMamba is run at (multi-scale run, see rppg/fusion.py)")
     p.add_argument("--weights", default=DEFAULT_WEIGHTS, help="RhythmMamba checkpoint (.pth)")
     p.add_argument("--device", default="auto", help="torch device for RhythmMamba: auto, cpu or mps")
     p.add_argument("--window", type=float, default=10.0, help="analysis window, s")
@@ -74,9 +81,12 @@ class Buffer:
 class Estimator:
     """Runs the methods off the UI thread; the newest result per method is in .results."""
 
-    def __init__(self, methods):
+    def __init__(self, methods, scales=fusion.SCALES):
         self.methods = methods
+        self.scales = scales
         self.smoothers = {m.name: sig.HRSmoother() for m in methods}
+        if len(methods) > 1:
+            self.smoothers[FUSED] = sig.HRSmoother()
         self.results = {}
         self.busy = False
         self._lock = threading.Lock()
@@ -91,16 +101,19 @@ class Estimator:
     def _run(self, snapshot, t_now):
         t, rgb, crop = snapshot
         try:
-            for m in self.methods:
-                t0 = time.perf_counter()
-                fs, bvp = m.bvp(t, rgb if m.needs == "rgb" else crop)
-                hr, snr, _, _ = sig.estimate_hr(bvp, fs)
-                sm = self.smoothers[m.name]
-                accepted = sm.push(hr, snr, t_now)
+            t0 = time.perf_counter()
+            per, (fhr, fsnr, _) = fusion.run_window(self.methods, t, rgb, crop, self.scales)
+            ms = 1000 * (time.perf_counter() - t0)
+            if len(self.methods) > 1:
+                first = per[self.methods[0].name]
+                per = {FUSED: dict(hr=fhr, snr=fsnr, fs=first["fs"], bvp=first["bvp"]), **per}
+            for name, r in per.items():
+                sm = self.smoothers[name]
+                accepted = sm.push(r["hr"], r["snr"], t_now)
                 with self._lock:
-                    self.results[m.name] = dict(
-                        t=t_now, hr=hr, snr=snr, hr_smooth=sm.value, accepted=accepted,
-                        bvp=bvp[-int(5 * fs):], ms=1000 * (time.perf_counter() - t0))
+                    self.results[name] = dict(
+                        t=t_now, hr=r["hr"], snr=r["snr"], hr_smooth=sm.value, accepted=accepted,
+                        bvp=r["bvp"][-int(5 * r["fs"]):], ms=ms)
         except Exception as e:  # keep the UI alive; show the error instead
             with self._lock:
                 self.results["error"] = repr(e)
@@ -142,7 +155,10 @@ def draw(frame, tracker, buf, results, fps, args, exposure_locked, recording, mo
         hr = res["hr_smooth"]
         txt = f"{name}: {hr:5.1f} bpm" if np.isfinite(hr) else f"{name}: --- bpm"
         cv2.putText(panel, txt, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.85, snr_color(res["snr"]), 2)
-        cv2.putText(panel, f"raw {res['hr']:5.1f}   SNR {res['snr']:5.1f} dB   {res['ms']:4.0f} ms",
+        detail = f"raw {res['hr']:5.1f}   SNR {res['snr']:5.1f} dB   {res['ms']:4.0f} ms"
+        if name == FUSED:
+            detail = f"raw {res['hr']:5.1f}   vote over all methods and time scales"
+        cv2.putText(panel, detail,
                     (14, y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (170, 170, 170), 1)
         y += 52
     if not names:
@@ -153,7 +169,7 @@ def draw(frame, tracker, buf, results, fps, args, exposure_locked, recording, mo
         cv2.putText(panel, results["error"][:80], (12, panel.shape[0] - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (60, 60, 230), 1)
 
-    # Waveform of the first method's BVP (last 5 s)
+    # Waveform of the first classic method's BVP (last 5 s)
     if names:
         bvp = results[names[0]]["bvp"]
         if len(bvp) > 2:
@@ -180,9 +196,11 @@ def main():
     args = parse_args()
 
     methods = []
-    if args.method in ("pos", "both"):
+    if args.method in ("pos", "both", "all"):
         methods.append(POS(fs=args.fs, window_s=args.window))
-    if args.method in ("rm", "both"):
+    if args.method in ("chrom", "all"):
+        methods.append(CHROM(fs=args.fs, window_s=args.window))
+    if args.method in ("rm", "both", "all"):
         if not os.path.exists(args.weights):
             raise SystemExit(f"RhythmMamba weights not found: {args.weights} (use --method pos)")
         import torch
@@ -196,7 +214,7 @@ def main():
         Camera(args.camera, lock_exposure=not args.no_lock)
     tracker = FaceTracker()
     buf = Buffer(args.window)
-    est = Estimator(methods)
+    est = Estimator(methods, args.scales)
     log = open(args.log, "a", newline="") if args.log else None
     logw = csv.writer(log) if log else None
     if log and log.tell() == 0:

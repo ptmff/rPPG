@@ -20,14 +20,14 @@ SCALES = (0.75, 1.0, 1.25)
 
 
 def multiscale(method, t, x, scales=SCALES):
-    """Runs a learned method at several time scales. Returns [(scale, hr, snr), ...]."""
+    """Runs a learned method at several time scales. Returns [(scale, hr, snr, fs, bvp), ...]."""
     base, out = method.fs, []
     try:
         for s in scales:
             method.fs = base * s
             fs, bvp = method.bvp(t, x)
             hr, snr = sig.estimate_hr(bvp, fs)[:2]
-            out.append((s, hr, snr))
+            out.append((s, hr, snr, fs, bvp))
     finally:
         method.fs = base
     return out
@@ -61,3 +61,31 @@ def octave_vote(estimates, tol=0.04):
             best = (key, float(np.mean(fund)), max(snrs), len(fund))
     _, hr, snr, support = best
     return hr, snr, support
+
+
+def family(method):
+    return "classic" if method.needs == "rgb" else "learned"
+
+
+def run_window(methods, t, rgb, crop, scales=SCALES):
+    """Runs every method on one window; learned ones at all scales (if more than one).
+
+    Returns (per_method, fused): per_method[name] = dict(hr, snr, fs, bvp, f, p), where a
+    learned method's hr/snr is its octave vote over the scales and fs/bvp/f/p are from
+    scale 1.0; fused = (hr, snr, support) over all methods and scales (NaN with < 2 votes)."""
+    per, votes = {}, []
+    for m in methods:
+        x = rgb if m.needs == "rgb" else crop
+        if family(m) == "learned" and len(scales) > 1:
+            runs = multiscale(m, t, x, scales)
+            votes += [(h, s, "learned") for _, h, s, _, _ in runs]
+            hr, snr, _ = octave_vote([(h, s, "learned") for _, h, s, _, _ in runs])
+            _, _, _, fs, bvp = min(runs, key=lambda r: abs(r[0] - 1.0))
+            _, _, f, p = sig.estimate_hr(bvp, fs)
+        else:
+            fs, bvp = m.bvp(t, x)
+            hr, snr, f, p = sig.estimate_hr(bvp, fs)
+            votes.append((hr, snr, family(m)))
+        per[m.name] = dict(hr=hr, snr=snr, fs=fs, bvp=bvp, f=f, p=p)
+    fused = octave_vote(votes) if len(votes) > 1 else (float("nan"), float("-inf"), 0)
+    return per, fused
