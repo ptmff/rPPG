@@ -3,11 +3,13 @@
     python analyze.py rec.npz
     python analyze.py rec.npz --ref 121,110,91,98,91 --ref-start 5 --ref-step 10
 
-For every 1 s step it re-runs the methods on the recorded frames and prints the estimate,
+For every 1 s step it re-runs the methods (POS, CHROM, RhythmMamba at all time scales) and
+the fused estimate (rppg/fusion.py) on the recorded frames and prints the estimate,
 the three strongest spectral peaks, frame rate, head motion and breathing rate (from the
 head's up/down motion). With reference values it also tells, per method:
   MAE          - error of the reported HR
-  ref in top-3 - how often the true HR is at least one of the three strongest peaks:
+  ref in top-3 - how often the true HR is at least one of the three strongest peaks
+                 (for RhythmMamba: of its x1.0 output, so a doubled pulse shows up here):
                  if high, better peak selection (fusion / tracking) can fix the errors;
                  if low, the signal is not there and only a better model / data helps.
 """
@@ -16,10 +18,13 @@ import os
 
 import numpy as np
 
+from rppg import fusion
 from rppg import signal as sig
+from rppg.methods.chrom import CHROM
 from rppg.methods.pos import POS
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+FUSED = "Fused"
 
 
 def parse_args():
@@ -31,6 +36,8 @@ def parse_args():
     p.add_argument("--weights", nargs="*", default=[os.path.join(HERE, "weights", "MMPD_intra_RhythmMamba.pth")],
                    help="RhythmMamba checkpoints to evaluate (none = POS only)")
     p.add_argument("--device", default="auto")
+    p.add_argument("--scales", type=float, nargs="+", default=list(fusion.SCALES),
+                   help="time scales RhythmMamba is run at; 1.0 = single-scale")
     p.add_argument("--window", type=float, default=10.0)
     p.add_argument("--min-window", type=float, default=6.0)
     p.add_argument("--step", type=float, default=1.0)
@@ -87,7 +94,7 @@ def main():
     face_all = data["face"] if "face" in data else None
     rt, rh = load_refs(args, data, t0)
 
-    methods = [POS(window_s=args.window)]
+    methods = [POS(window_s=args.window), CHROM(window_s=args.window)]
     if args.weights:
         import torch
         from rppg.methods.rhythmmamba import RhythmMambaMethod
@@ -119,13 +126,13 @@ def main():
                 c = face[:, :2] + face[:, 2:4] / 2
                 row["motion"] = np.ptp(c, axis=0).max() / np.median(face[:, 2])
                 row["breath"] = breathing(t, face)
-            for m in methods:
-                fs, bvp = m.bvp(t, rgb_all[sel] if m.needs == "rgb" else crop_all[sel])
-                hr, snr, f, p = sig.estimate_hr(bvp, fs)
-                row[m.name] = (hr, snr, top_peaks(f, p))
+            per, (fhr, fsnr, _) = fusion.run_window(methods, t, rgb_all[sel], crop_all[sel], args.scales)
+            for name, r in per.items():
+                row[name] = (r["hr"], r["snr"], top_peaks(r["f"], r["p"]))
+            row[FUSED] = (fhr, fsnr, [fhr])
             rows.append(row)
 
-    names = [m.name for m in methods]
+    names = [m.name for m in methods] + [FUSED]
     head = f"{'t':>6} {'fps':>5} {'mot':>5} {'brth':>5} {'ref':>5} | " + " | ".join(
         f"{n[:22]:22s} {'SNR':>5} {'top peaks':>14}" for n in names)
     print(head)
