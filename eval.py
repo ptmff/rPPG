@@ -3,6 +3,7 @@
     python eval.py                                   # all subjects in data/UBFC-rPPG
     python eval.py --subjects subject1 subject3      # a few
     python eval.py --weights weights/PURE_cross_RhythmMamba.pth
+    python eval.py --gdrive <folder URL>             # stream from Google Drive, one video at a time
 
 Expected layout (as on the dataset's Google Drive):  data/UBFC-rPPG/subjectN/{vid.avi, ground_truth.txt}
 ground_truth.txt: line 1 - PPG waveform, line 2 - oximeter HR, line 3 - timestamps, s.
@@ -10,6 +11,8 @@ ground_truth.txt: line 1 - PPG waveform, line 2 - oximeter HR, line 3 - timestam
 Each video goes through the same pipeline as live.py: YuNet tracking frame by frame,
 skin-ROI mean RGB for POS, 128x128 face crop for RhythmMamba. The per-frame data is cached
 (data/UBFC-rPPG/cache/*.npz), so re-running with other weights skips the video decoding.
+With --gdrive the videos are downloaded one by one, cached and deleted, so only one video is
+on disk at a time (the whole dataset is tens of GB).
 
 Two protocols:
   window - 10 s windows every 1 s (what the user sees in live.py)
@@ -51,7 +54,35 @@ def parse_args():
     p.add_argument("--low-hr", type=float, default=70.0)
     p.add_argument("--out", default=os.path.join(HERE, "results"))
     p.add_argument("--tag", default="ubfc", help="prefix of the output files")
+    p.add_argument("--gdrive", help="Google Drive folder with subjectN/{vid.avi, ground_truth.txt}: "
+                                    "download each video, cache it and delete it")
+    p.add_argument("--keep-video", action="store_true", help="with --gdrive: do not delete vid.avi")
     return p.parse_args()
+
+
+def gdrive_files(url):
+    """{subject: {file name: Drive id}} for a shared folder, without downloading anything."""
+    import gdown
+    files = {}
+    for f in gdown.download_folder(url, skip_download=True, quiet=True):
+        parts = f.path.replace(os.sep, "/").split("/")
+        if len(parts) >= 2:
+            files.setdefault(parts[-2], {})[parts[-1]] = f.id
+    return files
+
+
+def gdrive_fetch(ids, d, name):
+    import gdown
+    path = os.path.join(d, name)
+    if not os.path.exists(path):
+        os.makedirs(d, exist_ok=True)
+        if gdown.download(id=ids[name], output=path, quiet=True) is None:
+            raise RuntimeError(f"download failed: {path}")
+    return path
+
+
+def subject_key(s):
+    return int("".join(ch for ch in s if ch.isdigit()) or 0)
 
 
 # ---------------------------------------------------------------- data
@@ -138,11 +169,17 @@ def metrics(est, ref, snr):
 
 def main():
     args = parse_args()
-    subjects = args.subjects or sorted(
-        (s for s in os.listdir(args.data) if os.path.exists(os.path.join(args.data, s, "vid.avi"))),
-        key=lambda s: int("".join(ch for ch in s if ch.isdigit()) or 0))
+    cache_dir = os.path.join(args.data, "cache")
+    remote = gdrive_files(args.gdrive) if args.gdrive else {}
+    if remote:
+        print(f"Google Drive: {len(remote)} subject folders", flush=True)
+    local = [s for s in (os.listdir(args.data) if os.path.isdir(args.data) else [])
+             if os.path.exists(os.path.join(args.data, s, "vid.avi"))
+             or os.path.exists(os.path.join(cache_dir, s + ".npz"))]
+    subjects = args.subjects or sorted(set(local) | {s for s, f in remote.items() if "vid.avi" in f},
+                                       key=subject_key)
     if not subjects:
-        raise SystemExit(f"no subjects with vid.avi in {args.data}")
+        raise SystemExit(f"no subjects with vid.avi or cache in {args.data}")
 
     methods = [POS(fs=args.fs, window_s=args.window)]
     if args.weights:
@@ -159,9 +196,15 @@ def main():
     for s in subjects:
         t_start = time.perf_counter()
         d = os.path.join(args.data, s)
+        cache, vid = os.path.join(cache_dir, s + ".npz"), os.path.join(d, "vid.avi")
+        if s in remote:
+            gdrive_fetch(remote[s], d, "ground_truth.txt")
+            if not os.path.exists(cache):
+                gdrive_fetch(remote[s], d, "vid.avi")
         t_gt, ppg, ox = load_ground_truth(os.path.join(d, "ground_truth.txt"))
-        idx, rgb, crop, fps, missed = extract(os.path.join(d, "vid.avi"),
-                                              os.path.join(args.data, "cache", s + ".npz"))
+        idx, rgb, crop, fps, missed = extract(vid, cache)
+        if s in remote and not args.keep_video and os.path.exists(vid):
+            os.remove(vid)
         # Frame times: the ground-truth clock when it has a sample for every frame, else the file's fps
         t = t_gt[idx] if idx[-1] < len(t_gt) else idx / fps
         dur = min(t[-1], t_gt[-1])
