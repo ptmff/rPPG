@@ -21,7 +21,8 @@ import numpy as np
 
 from rppg import fusion
 from rppg import signal as sig
-from rppg.face import FaceTracker
+from rppg import tracking
+from rppg.face import F_POSE, FaceTracker
 from rppg.methods.chrom import CHROM
 from rppg.methods.pos import POS
 from rppg.source import Camera, VideoFile
@@ -46,6 +47,12 @@ def parse_args():
     p.add_argument("--update", type=float, default=1.0, help="re-estimate every N s")
     p.add_argument("--fs", type=float, default=30.0, help="internal resampling rate, Hz")
     p.add_argument("--no-lock", action="store_true", help="do not try to lock exposure / WB")
+    p.add_argument("--no-mesh", action="store_true",
+                   help="skin regions from YuNet's 5 landmarks instead of MediaPipe FaceMesh")
+    p.add_argument("--no-denoise", action="store_true",
+                   help="POS / CHROM: no background / head-motion denoising (rppg/multiregion.py)")
+    p.add_argument("--no-track", action="store_true",
+                   help="median of the last estimates instead of HR tracking (rppg/tracking.py)")
     p.add_argument("--headless", action="store_true", help="no window, print estimates")
     p.add_argument("--video-fps", type=float, help="override the FPS the video file reports")
     p.add_argument("--realtime", action="store_true", help="play --video at its real speed")
@@ -81,12 +88,14 @@ class Buffer:
 class Estimator:
     """Runs the methods off the UI thread; the newest result per method is in .results."""
 
-    def __init__(self, methods, scales=fusion.SCALES):
+    def __init__(self, methods, scales=fusion.SCALES, track=True):
         self.methods = methods
         self.scales = scales
-        self.smoothers = {m.name: sig.HRSmoother() for m in methods}
+        self.track = track
+        smoother = tracking.TrackedSmoother if track else sig.HRSmoother
+        self.smoothers = {m.name: smoother() for m in methods}
         if len(methods) > 1:
-            self.smoothers[FUSED] = sig.HRSmoother()
+            self.smoothers[FUSED] = smoother()
         self.results = {}
         self.busy = False
         self._lock = threading.Lock()
@@ -109,7 +118,15 @@ class Estimator:
                 per = {FUSED: dict(hr=fhr, snr=fsnr, fs=first["fs"], bvp=first["bvp"]), **per}
             for name, r in per.items():
                 sm = self.smoothers[name]
-                accepted = sm.push(r["hr"], r["snr"], t_now)
+                if not self.track:
+                    accepted = sm.push(r["hr"], r["snr"], t_now)
+                elif name != FUSED and fusion.family(next(m for m in self.methods if m.name == name)) == "classic":
+                    # the tracker reads the whole spectrum of a classic method; a learned one's
+                    # estimate is its vote over the time scales, so only that number is used
+                    accepted = sm.push(r["hr"], r["snr"], t_now, f=r["f"], p=r["p"],
+                                       resp_bpm=tracking.breathing_rate(t, rgb[:, F_POSE, 1]))
+                else:
+                    accepted = sm.push(r["hr"], r["snr"], t_now)
                 with self._lock:
                     self.results[name] = dict(
                         t=t_now, hr=r["hr"], snr=r["snr"], hr_smooth=sm.value, accepted=accepted,
@@ -141,8 +158,7 @@ def snr_color(snr):
 
 def draw(frame, tracker, buf, results, fps, args, exposure_locked, recording, motion):
     h, w = frame.shape[:2]
-    for x0, y0, x1, y1 in tracker.skin_rois():
-        cv2.rectangle(frame, (x0, y0), (x1, y1), (80, 200, 80), 1)
+    cv2.polylines(frame, tracker.skin_polygons(), True, (80, 200, 80), 1)
     r = tracker.crop_rect()
     if r:
         cv2.rectangle(frame, r[:2], r[2:], (40, 200, 230), 1)
@@ -197,9 +213,9 @@ def main():
 
     methods = []
     if args.method in ("pos", "both", "all"):
-        methods.append(POS(fs=args.fs, window_s=args.window))
+        methods.append(POS(fs=args.fs, window_s=args.window, denoise=not args.no_denoise))
     if args.method in ("chrom", "all"):
-        methods.append(CHROM(fs=args.fs, window_s=args.window))
+        methods.append(CHROM(fs=args.fs, window_s=args.window, denoise=not args.no_denoise))
     if args.method in ("rm", "both", "all"):
         if not os.path.exists(args.weights):
             raise SystemExit(f"RhythmMamba weights not found: {args.weights} (use --method pos)")
@@ -212,14 +228,14 @@ def main():
 
     src = VideoFile(args.video, realtime=args.realtime, fps=args.video_fps) if args.video else \
         Camera(args.camera, lock_exposure=not args.no_lock)
-    tracker = FaceTracker()
+    tracker = FaceTracker(mesh=False if args.no_mesh else None)
     buf = Buffer(args.window)
-    est = Estimator(methods, args.scales)
+    est = Estimator(methods, args.scales, track=not args.no_track)
     log = open(args.log, "a", newline="") if args.log else None
     logw = csv.writer(log) if log else None
     if log and log.tell() == 0:
         logw.writerow(["t", "method", "hr_raw", "snr_db", "hr_smooth", "accepted"])
-    rec = {"t": [], "rgb": [], "crop": [], "face": [], "ref_t": [], "ref_hr": []}
+    rec = {"t": [], "rgb": [], "feat": [], "crop": [], "face": [], "ref_t": [], "ref_hr": []}
     recording = bool(args.record)
     typed = ""  # reference HR being typed in the window
     last_logged = {}
@@ -237,11 +253,12 @@ def main():
             frame_times.append(t)
 
             if tracker.update(frame):
-                rgb, crop = tracker.mean_rgb(frame), tracker.crop(frame)
-                if rgb is not None and crop is not None:
-                    buf.add(t, rgb, crop)
+                feat, crop = tracker.features(frame), tracker.crop(frame)
+                if np.isfinite(feat[:3]).all(axis=1).any() and crop is not None:
+                    buf.add(t, feat, crop)
                     if recording:
-                        rec["t"].append(t), rec["rgb"].append(rgb), rec["crop"].append(crop)
+                        rec["t"].append(t), rec["rgb"].append(np.nanmean(feat[:3], axis=0))
+                        rec["feat"].append(feat), rec["crop"].append(crop)
                         rec["face"].append(tracker.face.copy())
                     centers.append(tracker.face[:2] + tracker.face[2:4] / 2)
             else:
@@ -309,6 +326,7 @@ def main():
             cv2.destroyAllWindows()
         if args.record and rec["t"]:
             np.savez_compressed(args.record, t=np.array(rec["t"]), rgb=np.array(rec["rgb"]),
+                                feat=np.array(rec["feat"]),
                                 crop=np.array(rec["crop"], dtype=np.uint8),
                                 face=np.array(rec["face"]), ref_t=np.array(rec["ref_t"]),
                                 ref_hr=np.array(rec["ref_hr"]))

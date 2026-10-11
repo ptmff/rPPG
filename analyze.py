@@ -20,11 +20,13 @@ import numpy as np
 
 from rppg import fusion
 from rppg import signal as sig
+from rppg import tracking
 from rppg.methods.chrom import CHROM
 from rppg.methods.pos import POS
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FUSED = "Fused"
+TRACKED = "Fused+track"  # the fused estimate through the HR tracker, as live.py shows it
 
 
 def parse_args():
@@ -60,12 +62,7 @@ def top_peaks(f, p, n=3, lo=sig.F_LO, hi=sig.F_HI, min_sep_hz=0.1):
 
 def breathing(t, face, fs=30.0):
     """Breathing rate (breaths/min) from the vertical head motion, 6-42 /min."""
-    y = face[:, 1] + face[:, 3] / 2
-    _, y = sig.resample_uniform(t, y, fs)
-    y = sig.detrend(y - y.mean(), 300)
-    f, p = sig.spectrum(y, fs)
-    band = (f >= 0.1) & (f <= 0.7)
-    return 60 * f[band][np.argmax(p[band])] if band.any() and p[band].sum() > 0 else float("nan")
+    return tracking.breathing_rate(t, face[:, 1] + face[:, 3] / 2, fs)
 
 
 def load_refs(args, data, t0):
@@ -90,7 +87,9 @@ def main():
     t_all = data["t"]
     t0 = t_all[0]
     t_all = t_all - t0
-    rgb_all, crop_all = data["rgb"], data["crop"]
+    # Per-region features (recordings made after the multi-region change) or one mean colour
+    rgb_all = data["feat"] if "feat" in data else data["rgb"]
+    crop_all = data["crop"]
     face_all = data["face"] if "face" in data else None
     rt, rh = load_refs(args, data, t0)
 
@@ -117,6 +116,7 @@ def main():
         t_seg = t_all[a:b]
         if len(t_seg) < 2 or t_seg[-1] - t_seg[0] < args.min_window:
             continue
+        trk = tracking.TrackedSmoother()
         for t_end in np.arange(t_seg[0] + args.min_window, t_seg[-1] + 1e-9, args.step):
             sel = slice(a + np.searchsorted(t_seg, t_end - args.window), a + np.searchsorted(t_seg, t_end, "right"))
             t = t_all[sel]
@@ -130,9 +130,11 @@ def main():
             for name, r in per.items():
                 row[name] = (r["hr"], r["snr"], top_peaks(r["f"], r["p"]))
             row[FUSED] = (fhr, fsnr, [fhr])
+            trk.push(fhr, fsnr, t_end)
+            row[TRACKED] = (trk.value, fsnr, [trk.value])
             rows.append(row)
 
-    names = [m.name for m in methods] + [FUSED]
+    names = [m.name for m in methods] + [FUSED, TRACKED]
     head = f"{'t':>6} {'fps':>5} {'mot':>5} {'brth':>5} {'ref':>5} | " + " | ".join(
         f"{n[:22]:22s} {'SNR':>5} {'top peaks':>14}" for n in names)
     print(head)
