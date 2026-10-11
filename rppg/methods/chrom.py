@@ -2,6 +2,7 @@
 No training; works on the mean skin colour over time, like POS."""
 import numpy as np
 
+from .. import multiregion
 from .. import signal as sig
 
 
@@ -9,13 +10,21 @@ class CHROM:
     name = "CHROM"
     needs = "rgb"
 
-    def __init__(self, fs=30.0, window_s=10.0, sub_s=1.6):
+    def __init__(self, fs=30.0, window_s=10.0, sub_s=1.6, denoise=True):
         self.fs = fs
+        self.denoise = denoise
         self.window_s = window_s
         self.sub_s = sub_s
 
-    def bvp(self, t, rgb):
-        """t: (N,) timestamps in s, rgb: (N, 3) mean skin colour. Returns uniform-fs BVP."""
+    def bvp(self, t, x):
+        """t: (N,) timestamps in s; x: (N, 3) mean skin colour, or (N, N_FEATURES, 3) from
+        FaceTracker.features() for the multi-region run with denoising. Returns (fs, BVP)."""
+        if np.ndim(x) == 3:
+            return multiregion.bvp(self.trace, self.fs, t, x, self.denoise)[:2]
+        return self.trace(t, x)
+
+    def trace(self, t, rgb):
+        """BVP of one colour trace: t (N,) timestamps, rgb (N, 3). Returns (fs, BVP)."""
         _, c = sig.resample_uniform(t, rgb, self.fs)
         n = len(c)
         l = int(np.ceil(self.sub_s * self.fs))  # sub-windows, Hann-weighted and overlap-added
